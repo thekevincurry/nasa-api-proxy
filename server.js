@@ -87,6 +87,13 @@ app.get('/health', (req, res) => {
   });
 });
 
+// Helper function to extract YouTube video ID
+function extractYouTubeId(url) {
+  const regex = /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/;
+  const match = url.match(regex);
+  return match ? match[1] : null;
+}
+
 // NASA APOD endpoint
 app.get('/api/nasa/apod', async (req, res) => {
   try {
@@ -112,11 +119,31 @@ app.get('/api/nasa/apod', async (req, res) => {
       { timeout: 10000 }
     );
     
+    // Handle video content by providing thumbnail or fallback
+    const nasaData = response.data;
+    if (nasaData.media_type === 'video' && nasaData.url) {
+      // For videos, try to extract a thumbnail or use a placeholder
+      if (nasaData.url.includes('youtube.com') || nasaData.url.includes('youtu.be')) {
+        // Extract YouTube video ID and create thumbnail URL
+        const videoId = extractYouTubeId(nasaData.url);
+        if (videoId) {
+          nasaData.thumbnail_url = `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`;
+        }
+      } else if (nasaData.url.includes('vimeo.com')) {
+        // For Vimeo, we'll need to keep the original URL
+        // Vimeo thumbnails require API calls, so we'll use a space placeholder
+        nasaData.thumbnail_url = "https://images.unsplash.com/photo-1446776877081-d282a0f896e2?w=800&h=600&fit=crop";
+      }
+      
+      // Keep the original video URL for potential future video playback
+      nasaData.video_url = nasaData.url;
+    }
+    
     // Cache result for 6 hours
-    await setCache(cacheKey, JSON.stringify(response.data), 21600);
+    await setCache(cacheKey, JSON.stringify(nasaData), 21600);
     
     console.log('✅ APOD fetched and cached successfully');
-    res.json(response.data);
+    res.json(nasaData);
   } catch (error) {
     console.error('APOD API error:', error.message);
     
