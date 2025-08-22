@@ -41,6 +41,24 @@ app.use('/cdn', express.static(PUBLIC_DIR, {
   immutable: false,
 }));
 
+// Meta storage for last-known-good items
+const META_DIR = path.join(PUBLIC_DIR, '_meta');
+const LAST_EPIC_PATH = path.join(META_DIR, 'last_epic.json');
+
+async function saveLastEpic(entry) {
+  try {
+    await ensureDir(META_DIR);
+    await fsp.writeFile(LAST_EPIC_PATH, JSON.stringify(entry, null, 2), 'utf-8');
+  } catch (_) { /* ignore */ }
+}
+
+async function loadLastEpic() {
+  try {
+    const raw = await fsp.readFile(LAST_EPIC_PATH, 'utf-8');
+    return JSON.parse(raw);
+  } catch (_) { return null; }
+}
+
 // Create an axios client that prefers IPv4 (helps avoid IPv6/proxy issues) and reuses connections
 const ipv4Lookup = (hostname, options, callback) => {
   return dns.lookup(hostname, { all: false, family: 4 }, callback);
@@ -356,7 +374,7 @@ app.get('/api/nasa/epic', async (req, res) => {
           const gsfcUrl = `https://epic.gsfc.nasa.gov/archive/${usedCollection}/${datePath}/${ext}/${filename}`;
           const subpath = path.join('nasa', 'epic', yyyy, mm, dd, filename);
           const cdnUrl = await cacheImageIfNeeded(gsfcUrl, subpath, req);
-          if (cdnUrl) { chosen = { cdnUrl, original: gsfcUrl }; break; }
+          if (cdnUrl) { chosen = { cdnUrl, original: gsfcUrl, subpath }; break; }
         }
         if (!chosen && NASA_API_KEY) {
           for (const ext of extCandidates) {
@@ -364,7 +382,7 @@ app.get('/api/nasa/epic', async (req, res) => {
             const apiUrl = `https://api.nasa.gov/EPIC/archive/${usedCollection}/${datePath}/${ext}/${filename}?api_key=${NASA_API_KEY}`;
             const subpath = path.join('nasa', 'epic', yyyy, mm, dd, filename);
             const cdnUrl = await cacheImageIfNeeded(apiUrl, subpath, req);
-            if (cdnUrl) { chosen = { cdnUrl, original: `https://epic.gsfc.nasa.gov/archive/${usedCollection}/${datePath}/${ext}/${filename}` }; break; }
+            if (cdnUrl) { chosen = { cdnUrl, original: `https://epic.gsfc.nasa.gov/archive/${usedCollection}/${datePath}/${ext}/${filename}`, subpath }; break; }
           }
         }
         // Thumbs fallback (jpg only)
@@ -375,7 +393,7 @@ app.get('/api/nasa/epic', async (req, res) => {
           const subpath = path.join('nasa', 'epic', yyyy, mm, dd, 'thumbs', filename);
           const cdnUrl = await cacheImageIfNeeded(gsfcThumb, subpath, req);
           if (cdnUrl) {
-            chosen = { cdnUrl, original: gsfcThumb };
+            chosen = { cdnUrl, original: gsfcThumb, subpath };
           }
         }
         if (!chosen && NASA_API_KEY) {
@@ -385,13 +403,20 @@ app.get('/api/nasa/epic', async (req, res) => {
           const subpath = path.join('nasa', 'epic', yyyy, mm, dd, 'thumbs', filename);
           const cdnUrl = await cacheImageIfNeeded(apiThumb, subpath, req);
           if (cdnUrl) {
-            chosen = { cdnUrl, original: `https://epic.gsfc.nasa.gov/archive/${usedCollection}/${datePath}/thumbs/${filename}` };
+            chosen = { cdnUrl, original: `https://epic.gsfc.nasa.gov/archive/${usedCollection}/${datePath}/thumbs/${filename}`, subpath };
           }
         }
 
         if (chosen) {
           const enriched = { ...item, image_url: chosen.cdnUrl, original_url: chosen.original, collection: usedCollection };
           enhanced.push(enriched);
+          // Save last-known-good entry for offline fallback
+          saveLastEpic({
+            date: item.date,
+            collection: usedCollection,
+            subpath: chosen.subpath,
+            original_url: chosen.original
+          }).catch(() => {});
           if (!firstImageFound) firstImageFound = enriched;
           // If we found a valid image, we can stop early
           break;
@@ -410,7 +435,27 @@ app.get('/api/nasa/epic', async (req, res) => {
   } catch (error) {
     console.error('EPIC API error:', error.message);
     
-    // Return fallback data
+    // Try last-known-good EPIC from local cache to avoid external fetches
+    try {
+      const last = await loadLastEpic();
+      if (last && last.subpath) {
+        const base = getPublicBase(req) || '';
+        const cdnUrl = `${base}/cdn/${last.subpath}`;
+        console.log('🌍 Serving last-known-good EPIC');
+        return res.json([
+          {
+            identifier: 'last_known_good',
+            image: path.basename(last.subpath, path.extname(last.subpath)),
+            date: last.date || new Date().toISOString().split('T')[0] + ' 00:00:00',
+            image_url: cdnUrl,
+            original_url: last.original_url,
+            collection: last.collection || 'natural'
+          }
+        ]);
+      }
+    } catch (_) { /* ignore and continue to static fallback */ }
+
+    // Return static fallback data (may still attempt external fetches)
     const fallback = [{
       identifier: "20240810_000000",
       caption: "This image was taken by the EPIC camera aboard the NOAA DSCOVR satellite",
