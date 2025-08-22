@@ -17,19 +17,27 @@ app.use(cors());
 app.use(express.json());
 app.set('trust proxy', true); // allow x-forwarded-* headers for proto/host behind proxies
 
-// Simple request timeout middleware (default 20s) to prevent hanging requests
+// Simple request timeout flag (default 20s) to guide handlers; we avoid sending a 504 here to prevent double responses
 const ROUTE_TIMEOUT_MS = parseInt(process.env.ROUTE_TIMEOUT_MS || '20000', 10);
 app.use((req, res, next) => {
   res.setHeader('X-Server', 'The-Inner-Citadel');
-  const timer = setTimeout(() => {
-    if (!res.headersSent) {
-      res.status(504).json({ error: 'Gateway Timeout', route: req.originalUrl });
-    }
-  }, ROUTE_TIMEOUT_MS);
+  req.timedOut = false;
+  const timer = setTimeout(() => { req.timedOut = true; }, ROUTE_TIMEOUT_MS);
   res.on('finish', () => clearTimeout(timer));
   res.on('close', () => clearTimeout(timer));
   next();
 });
+
+function isDone(res) {
+  return res.headersSent || res.writableEnded;
+}
+
+function respondJson(res, body, status = 200) {
+  if (isDone(res)) return false;
+  if (status !== 200) res.status(status);
+  res.json(body);
+  return true;
+}
 
 const NASA_API_KEY = process.env.NASA_API_KEY;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL; // e.g. https://stoic-app-thbdd.ondigitalocean.app
@@ -260,8 +268,8 @@ app.get('/api/nasa/apod', async (req, res) => {
       }
     }
 
-    console.log('✅ APOD fetched successfully');
-    res.json(nasaData);
+  console.log('✅ APOD fetched successfully');
+  if (!respondJson(res, nasaData)) return;
   } catch (error) {
     console.error('APOD API error:', error.message);
     
@@ -278,7 +286,7 @@ app.get('/api/nasa/apod', async (req, res) => {
   // Also set display_url to a known reliable image
   fallback.display_url = fallback.hdurl || fallback.url;
   console.log('📷 Serving fallback APOD data');
-  res.json(fallback);
+  respondJson(res, fallback);
   }
 });
 
@@ -430,8 +438,8 @@ app.get('/api/nasa/epic', async (req, res) => {
       }
     }
 
-    console.log('✅ EPIC fetched successfully');
-    res.json(enhanced);
+  console.log('✅ EPIC fetched successfully');
+  if (!respondJson(res, enhanced)) return;
   } catch (error) {
     console.error('EPIC API error:', error.message);
     
@@ -455,113 +463,18 @@ app.get('/api/nasa/epic', async (req, res) => {
       }
     } catch (_) { /* ignore and continue to static fallback */ }
 
-    // Return static fallback data (may still attempt external fetches)
+    // Return static fallback data fast (no remote fetches)
     const fallback = [{
-      identifier: "20240810_000000",
-      caption: "This image was taken by the EPIC camera aboard the NOAA DSCOVR satellite",
-      image: "epic_1b_20240810000000",
-      version: "03",
-      centroid_coordinates: {
-        lat: 0.0,
-        lon: 0.0
-      },
-      dscovr_j2000_position: {
-        x: -1394708.63,
-        y: 576971.88,
-        z: 246324.69
-      },
-      lunar_j2000_position: {
-        x: 25949.44,
-        y: -351738.88,
-        z: -152481.00
-      },
-      sun_j2000_position: {
-        x: -37296566.44,
-        y: -139990462.88,
-        z: -60673090.00
-      },
-      attitude_quaternions: {
-        q0: -0.374760,
-        q1: 0.024730,
-        q2: 0.015829,
-        q3: 0.926654
-      },
-      date: "2024-08-10 00:00:00",
-      coords: {
-        centroid_coordinates: {
-          lat: 0.0,
-          lon: 0.0
-        },
-        dscovr_j2000_position: {
-          x: -1394708.63,
-          y: 576971.88,
-          z: 246324.69
-        },
-        lunar_j2000_position: {
-          x: 25949.44,
-          y: -351738.88,
-          z: -152481.00
-        },
-        sun_j2000_position: {
-          x: -37296566.44,
-          y: -139990462.88,
-          z: -60673090.00
-        },
-        attitude_quaternions: {
-          q0: -0.374760,
-          q1: 0.024730,
-          q2: 0.015829,
-          q3: 0.926654
-        }
-      }
+      identifier: 'fallback_epic',
+      caption: 'EPIC data temporarily unavailable; showing a placeholder Earth image',
+      image: 'placeholder',
+      date: new Date().toISOString().split('T')[0] + ' 00:00:00',
+      image_url: 'https://images.unsplash.com/photo-1451187580459-43490279c0fa?w=1200&auto=format&fit=crop&q=80',
+      original_url: null,
+      collection: 'natural'
     }];
-    
-    // Provide image_url for fallback as well (try PNG, then JPG, then thumbs, then api.nasa.gov)
-    try {
-      const item = fallback[0];
-      const dateObj = new Date(item.date.replace(' ', 'T') + 'Z');
-      const yyyy = String(dateObj.getUTCFullYear());
-      const mm = String(dateObj.getUTCMonth() + 1).padStart(2, '0');
-  const dd = String(dateObj.getUTCDate()).padStart(2, '0');
-      const datePath = `${yyyy}/${mm}/${dd}`;
-      const extCandidates = ['png', 'jpg'];
-      let chosen = null;
-      for (const ext of extCandidates) {
-        const filename = `${item.image}.${ext}`;
-        const gsfcUrl = `https://epic.gsfc.nasa.gov/archive/natural/${datePath}/${ext}/${filename}`;
-        const subpath = path.join('nasa', 'epic', yyyy, mm, dd, filename);
-        const cdnUrl = await cacheImageIfNeeded(gsfcUrl, subpath, req);
-        if (cdnUrl) { chosen = { cdnUrl, original: gsfcUrl }; break; }
-      }
-      if (!chosen) {
-        const filename = `${item.image}.jpg`;
-        const gsfcThumb = `https://epic.gsfc.nasa.gov/archive/natural/${datePath}/thumbs/${filename}`;
-        const subpath = path.join('nasa', 'epic', yyyy, mm, dd, 'thumbs', filename);
-        const cdnUrl = await cacheImageIfNeeded(gsfcThumb, subpath, req);
-        if (cdnUrl) { chosen = { cdnUrl, original: gsfcThumb }; }
-      }
-      if (!chosen && NASA_API_KEY) {
-        for (const ext of extCandidates) {
-          const filename = `${item.image}.${ext}`;
-          const apiUrl = `https://api.nasa.gov/EPIC/archive/natural/${datePath}/${ext}/${filename}?api_key=${NASA_API_KEY}`;
-          const subpath = path.join('nasa', 'epic', yyyy, mm, dd, filename);
-          const cdnUrl = await cacheImageIfNeeded(apiUrl, subpath, req);
-          if (cdnUrl) { chosen = { cdnUrl, original: `https://epic.gsfc.nasa.gov/archive/natural/${datePath}/${ext}/${filename}` }; break; }
-        }
-      }
-      if (!chosen && NASA_API_KEY) {
-        const filename = `${item.image}.jpg`;
-        const apiThumb = `https://api.nasa.gov/EPIC/archive/natural/${datePath}/thumbs/${filename}?api_key=${NASA_API_KEY}`;
-        const subpath = path.join('nasa', 'epic', yyyy, mm, dd, 'thumbs', filename);
-        const cdnUrl = await cacheImageIfNeeded(apiThumb, subpath, req);
-        if (cdnUrl) { chosen = { cdnUrl, original: `https://epic.gsfc.nasa.gov/archive/natural/${datePath}/thumbs/${filename}` }; }
-      }
-      if (chosen) {
-        fallback[0] = { ...item, image_url: chosen.cdnUrl, original_url: chosen.original };
-      }
-    } catch {}
-    console.log('🌍 Serving fallback EPIC data');
-    res.json(fallback);
+    console.log('🌍 Serving static fallback EPIC');
+    respondJson(res, fallback);
   }
 });
 
