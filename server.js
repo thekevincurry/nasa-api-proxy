@@ -197,14 +197,34 @@ app.get('/api/nasa/epic', async (req, res) => {
       throw new Error('NASA_API_KEY not configured');
     }
     
-    // Fetch from NASA
-    const response = await axios.get(
-      `https://api.nasa.gov/EPIC/api/natural?api_key=${NASA_API_KEY}`,
-      { timeout: 15000 }
-    );
-    
+    // Fetch from NASA: allow optional ?date=YYYY-MM-DD and fallback across recent days if needed
+    const dateParam = (req.query.date || '').toString().trim();
+    const baseApi = 'https://api.nasa.gov/EPIC/api/natural';
+    const tryFetch = async (url) => axios.get(url, { timeout: 20000 }).then(r => r.data).catch(() => null);
+    let items = null;
+    if (dateParam) {
+      items = await tryFetch(`${baseApi}/date/${dateParam}?api_key=${NASA_API_KEY}`);
+    } else {
+      items = await tryFetch(`${baseApi}?api_key=${NASA_API_KEY}`);
+    }
+    // If nothing came back, look back up to 5 days
+    if (!items || (Array.isArray(items) && items.length === 0)) {
+      const lookback = 5;
+      const now = new Date();
+      for (let i = 1; i <= lookback; i++) {
+        const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+        d.setUTCDate(d.getUTCDate() - i);
+        const yyyy = d.getUTCFullYear();
+        const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+        const dd = String(d.getUTCDate()).padStart(2, '0');
+        const ds = `${yyyy}-${mm}-${dd}`;
+        const alt = await tryFetch(`${baseApi}/date/${ds}?api_key=${NASA_API_KEY}`);
+        if (alt && Array.isArray(alt) && alt.length > 0) { items = alt; break; }
+      }
+    }
+    if (!items) throw new Error('EPIC API returned no data');
     // Attach backend-hosted image_url for each record and cache the image
-    const items = Array.isArray(response.data) ? response.data : [response.data];
+    items = Array.isArray(items) ? items : [items];
     const enhanced = [];
     for (const item of items) {
       try {
@@ -319,7 +339,7 @@ app.get('/api/nasa/epic', async (req, res) => {
       const dateObj = new Date(item.date.replace(' ', 'T') + 'Z');
       const yyyy = String(dateObj.getUTCFullYear());
       const mm = String(dateObj.getUTCMonth() + 1).padStart(2, '0');
-      const dd = String(dateObj.getUTCDate());
+  const dd = String(dateObj.getUTCDate()).padStart(2, '0');
       const datePath = `${yyyy}/${mm}/${dd}`;
       const extCandidates = ['png', 'jpg'];
       let chosen = null;
