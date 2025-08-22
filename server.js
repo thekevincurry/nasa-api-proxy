@@ -2,6 +2,9 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const fs = require('fs');
+const fsp = require('fs').promises;
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -11,6 +14,45 @@ app.use(cors());
 app.use(express.json());
 
 const NASA_API_KEY = process.env.NASA_API_KEY;
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL; // e.g. https://stoic-app-thbdd.ondigitalocean.app
+
+// Serve cached static assets (images) from ./public via /cdn
+const PUBLIC_DIR = path.join(__dirname, 'public');
+app.use('/cdn', express.static(PUBLIC_DIR, {
+  maxAge: '12h',
+  immutable: false,
+}));
+
+async function ensureDir(dirPath) {
+  await fsp.mkdir(dirPath, { recursive: true }).catch(() => {});
+}
+
+// Download an image to the local cache if missing; return absolute public URL
+async function cacheImageIfNeeded(sourceUrl, subpath) {
+  try {
+    const localPath = path.join(PUBLIC_DIR, subpath);
+    const localDir = path.dirname(localPath);
+    await ensureDir(localDir);
+    if (!fs.existsSync(localPath)) {
+      console.log(`⬇️ Caching image -> ${sourceUrl} -> /cdn/${subpath}`);
+      const resp = await axios.get(sourceUrl, { responseType: 'stream', timeout: 20000 });
+      await new Promise((resolve, reject) => {
+        const w = fs.createWriteStream(localPath);
+        resp.data.pipe(w);
+        w.on('finish', resolve);
+        w.on('error', reject);
+      });
+      console.log(`🗂️ Image cached: /cdn/${subpath}`);
+    } else {
+      console.log(`🗂️ Using cached image: /cdn/${subpath}`);
+    }
+    const base = PUBLIC_BASE_URL || '';
+    return `${base}/cdn/${subpath}`;
+  } catch (e) {
+    console.error('❌ cacheImageIfNeeded error:', e.message);
+    return null;
+  }
+}
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -49,8 +91,8 @@ app.get('/api/nasa/apod', async (req, res) => {
     // Handle video content by providing thumbnail or fallback
     const nasaData = response.data;
     
-    // Handle different media types
-    if (nasaData.media_type === 'video' && nasaData.url) {
+  // Handle different media types
+  if (nasaData.media_type === 'video' && nasaData.url) {
       // Standard video content with URL (YouTube, Vimeo, etc.)
       if (nasaData.url.includes('youtube.com') || nasaData.url.includes('youtu.be')) {
         // Extract YouTube video ID and create thumbnail URL
@@ -90,6 +132,31 @@ app.get('/api/nasa/apod', async (req, res) => {
       }
     }
     
+    // Choose a display URL (image) to cache & serve from our backend
+    let originalDisplay = null;
+    if (nasaData.media_type === 'image') {
+      originalDisplay = nasaData.hdurl || nasaData.url || null;
+    } else if (nasaData.media_type === 'video') {
+      originalDisplay = nasaData.thumbnail_url || null;
+    }
+
+    if (originalDisplay) {
+      try {
+        // Determine extension
+        const ext = path.extname(new URL(originalDisplay).pathname) || '.jpg';
+        const dateStr = (nasaData.date || new Date().toISOString().split('T')[0]).replace(/\//g, '-');
+        const filename = `apod_${dateStr}${ext}`;
+        const subpath = path.join('nasa', 'apod', filename);
+        const cdnUrl = await cacheImageIfNeeded(originalDisplay, subpath);
+        if (cdnUrl) {
+          nasaData.display_url = cdnUrl; // prefer this in clients
+          nasaData.original_url = originalDisplay; // keep original for reference
+        }
+      } catch (e) {
+        console.error('APOD cache error:', e.message);
+      }
+    }
+
     console.log('✅ APOD fetched successfully');
     res.json(nasaData);
   } catch (error) {
@@ -105,8 +172,10 @@ app.get('/api/nasa/apod', async (req, res) => {
       date: new Date().toISOString().split('T')[0]
     };
     
-    console.log('📷 Serving fallback APOD data');
-    res.json(fallback);
+  // Also set display_url to a known reliable image
+  fallback.display_url = fallback.hdurl || fallback.url;
+  console.log('📷 Serving fallback APOD data');
+  res.json(fallback);
   }
 });
 
@@ -125,8 +194,30 @@ app.get('/api/nasa/epic', async (req, res) => {
       { timeout: 15000 }
     );
     
+    // Attach backend-hosted image_url for each record and cache the image
+    const items = Array.isArray(response.data) ? response.data : [response.data];
+    const enhanced = [];
+    for (const item of items) {
+      try {
+        // EPIC date like "2024-08-10 00:00:00" => yyyy/MM/dd
+        const dateObj = new Date(item.date.replace(' ', 'T') + 'Z');
+        const yyyy = String(dateObj.getUTCFullYear());
+        const mm = String(dateObj.getUTCMonth() + 1).padStart(2, '0');
+        const dd = String(dateObj.getUTCDate()).padStart(2, '0');
+        const datePath = `${yyyy}/${mm}/${dd}`;
+        const filename = `${item.image}.png`;
+        const nasaUrl = `https://epic.gsfc.nasa.gov/archive/natural/${datePath}/png/${filename}`;
+        const subpath = path.join('nasa', 'epic', yyyy, mm, dd, filename);
+        const cdnUrl = await cacheImageIfNeeded(nasaUrl, subpath);
+        enhanced.push({ ...item, image_url: cdnUrl || nasaUrl, original_url: nasaUrl });
+      } catch (e) {
+        console.error('EPIC enhance error:', e.message);
+        enhanced.push(item);
+      }
+    }
+
     console.log('✅ EPIC fetched successfully');
-    res.json(response.data);
+    res.json(enhanced);
   } catch (error) {
     console.error('EPIC API error:', error.message);
     
@@ -191,6 +282,20 @@ app.get('/api/nasa/epic', async (req, res) => {
       }
     }];
     
+    // Provide image_url for fallback as well
+    try {
+      const item = fallback[0];
+      const dateObj = new Date(item.date.replace(' ', 'T') + 'Z');
+      const yyyy = String(dateObj.getUTCFullYear());
+      const mm = String(dateObj.getUTCMonth() + 1).padStart(2, '0');
+      const dd = String(dateObj.getUTCDate()).padStart(2, '0');
+      const datePath = `${yyyy}/${mm}/${dd}`;
+      const filename = `${item.image}.png`;
+      const nasaUrl = `https://epic.gsfc.nasa.gov/archive/natural/${datePath}/png/${filename}`;
+      const subpath = path.join('nasa', 'epic', yyyy, mm, dd, filename);
+      const cdnUrl = await cacheImageIfNeeded(nasaUrl, subpath);
+      fallback[0] = { ...item, image_url: cdnUrl || nasaUrl, original_url: nasaUrl };
+    } catch {}
     console.log('🌍 Serving fallback EPIC data');
     res.json(fallback);
   }
