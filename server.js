@@ -17,6 +17,20 @@ app.use(cors());
 app.use(express.json());
 app.set('trust proxy', true); // allow x-forwarded-* headers for proto/host behind proxies
 
+// Simple request timeout middleware (default 20s) to prevent hanging requests
+const ROUTE_TIMEOUT_MS = parseInt(process.env.ROUTE_TIMEOUT_MS || '20000', 10);
+app.use((req, res, next) => {
+  res.setHeader('X-Server', 'The-Inner-Citadel');
+  const timer = setTimeout(() => {
+    if (!res.headersSent) {
+      res.status(504).json({ error: 'Gateway Timeout', route: req.originalUrl });
+    }
+  }, ROUTE_TIMEOUT_MS);
+  res.on('finish', () => clearTimeout(timer));
+  res.on('close', () => clearTimeout(timer));
+  next();
+});
+
 const NASA_API_KEY = process.env.NASA_API_KEY;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL; // e.g. https://stoic-app-thbdd.ondigitalocean.app
 
@@ -41,11 +55,11 @@ const axiosClient = axios.create({
 });
 
 // Generic fetch with simple retry/backoff; do not retry on 4xx
-async function fetchJsonWithRetry(url, { attempts = 3, initialDelayMs = 300 } = {}) {
+async function fetchJsonWithRetry(url, { attempts = 2, initialDelayMs = 250, timeoutMs = 15000 } = {}) {
   let lastErr = null;
   for (let i = 1; i <= attempts; i++) {
     try {
-      const resp = await axiosClient.get(url, { responseType: 'json' });
+  const resp = await axiosClient.get(url, { responseType: 'json', timeout: timeoutMs });
       return resp.data;
     } catch (e) {
       lastErr = e;
@@ -287,41 +301,45 @@ app.get('/api/nasa/epic', async (req, res) => {
       }
     };
 
+    // Strategy: available-first, then limited lookback to reduce latency; limit items processed to 1–2
     for (const collection of collectionsToTry) {
       usedCollection = collection;
-      // 1) Try requested date or today API
-      items = await fetchItemsFor(collection, dateParam || null);
-      // 2) If nothing, walk back up to 10 days
-      if (!items || (Array.isArray(items) && items.length === 0)) {
-        const lookback = 10;
-        const now = new Date();
-        for (let i = 1; i <= lookback; i++) {
-          const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
-          d.setUTCDate(d.getUTCDate() - i);
-          const yyyy = d.getUTCFullYear();
-          const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-          const dd = String(d.getUTCDate()).padStart(2, '0');
-          const ds = `${yyyy}-${mm}-${dd}`;
-          const alt = await fetchItemsFor(collection, ds);
-          if (alt && Array.isArray(alt) && alt.length > 0) { items = alt; break; }
-        }
+      const available = await fetchAvailableDates(collection);
+      const candidateDates = [];
+      if (dateParam) candidateDates.push(dateParam);
+      // add latest available dates (up to 3) if not already included
+      for (const d of available.slice(0, 3)) {
+        if (!candidateDates.includes(d)) candidateDates.push(d);
       }
-      // 3) If still nothing, use the 'available' list and pick the latest date
+      // add yesterday as a simple fallback
+      if (candidateDates.length === 0) {
+        const now = new Date();
+        const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1));
+        const yyyy = d.getUTCFullYear();
+        const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+        const dd = String(d.getUTCDate()).padStart(2, '0');
+        candidateDates.push(`${yyyy}-${mm}-${dd}`);
+      }
+
+      for (const ds of candidateDates) {
+        const alt = await fetchItemsFor(collection, ds);
+        if (alt && Array.isArray(alt) && alt.length > 0) { items = alt; break; }
+      }
+
       if (!items || (Array.isArray(items) && items.length === 0)) {
-        const dates = await fetchAvailableDates(collection);
-        if (dates.length > 0) {
-          // prefer most recent available date
-          const latest = dates[0];
-          items = await fetchItemsFor(collection, latest);
-        }
+        // As a final attempt, call without a date (today endpoint)
+        items = await fetchItemsFor(collection, null);
       }
       if (items && Array.isArray(items) && items.length > 0) break; // got data
     }
     if (!items) throw new Error('EPIC API returned no data');
     // Attach backend-hosted image_url for each record and cache the image
     items = Array.isArray(items) ? items : [items];
+    // Only process first 2 items to avoid long hangs; clients only need one most recent image
+    const slice = items.slice(0, 2);
     const enhanced = [];
-    for (const item of items) {
+    let firstImageFound = null;
+    for (const item of slice) {
       try {
         // EPIC date like "YYYY-MM-DD HH:mm:ss" => yyyy/MM/dd
         const dateObj = new Date((item.date || '').replace(' ', 'T') + 'Z');
@@ -372,7 +390,11 @@ app.get('/api/nasa/epic', async (req, res) => {
         }
 
         if (chosen) {
-          enhanced.push({ ...item, image_url: chosen.cdnUrl, original_url: chosen.original });
+          const enriched = { ...item, image_url: chosen.cdnUrl, original_url: chosen.original, collection: usedCollection };
+          enhanced.push(enriched);
+          if (!firstImageFound) firstImageFound = enriched;
+          // If we found a valid image, we can stop early
+          break;
         } else {
           // Could not cache; return item without image_url to avoid 404s
           enhanced.push({ ...item, original_url: undefined });
