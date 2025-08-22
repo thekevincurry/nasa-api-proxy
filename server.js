@@ -2,6 +2,9 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const dns = require('dns');
+const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const fsp = require('fs').promises;
 const path = require('path');
@@ -24,6 +27,42 @@ app.use('/cdn', express.static(PUBLIC_DIR, {
   immutable: false,
 }));
 
+// Create an axios client that prefers IPv4 (helps avoid IPv6/proxy issues) and reuses connections
+const ipv4Lookup = (hostname, options, callback) => {
+  return dns.lookup(hostname, { all: false, family: 4 }, callback);
+};
+const axiosClient = axios.create({
+  timeout: 20000,
+  httpAgent: new http.Agent({ keepAlive: true, lookup: ipv4Lookup }),
+  httpsAgent: new https.Agent({ keepAlive: true, lookup: ipv4Lookup }),
+  headers: {
+    'User-Agent': 'The-Inner-Citadel/1.0 (+https://example.com)'
+  }
+});
+
+// Generic fetch with simple retry/backoff; do not retry on 4xx
+async function fetchJsonWithRetry(url, { attempts = 3, initialDelayMs = 300 } = {}) {
+  let lastErr = null;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const resp = await axiosClient.get(url, { responseType: 'json' });
+      return resp.data;
+    } catch (e) {
+      lastErr = e;
+      const status = e.response?.status;
+      if (status && status >= 400 && status < 500 && status !== 429) {
+        // Client error (except 429): do not retry
+        break;
+      }
+      if (i < attempts) {
+        const delay = initialDelayMs * Math.pow(2, i - 1);
+        await new Promise(r => setTimeout(r, delay));
+      }
+    }
+  }
+  throw lastErr || new Error('Request failed');
+}
+
 async function ensureDir(dirPath) {
   await fsp.mkdir(dirPath, { recursive: true }).catch(() => {});
 }
@@ -44,13 +83,36 @@ async function cacheImageIfNeeded(sourceUrl, subpath, req) {
     await ensureDir(localDir);
     if (!fs.existsSync(localPath)) {
       console.log(`⬇️ Caching image -> ${sourceUrl} -> /cdn/${subpath}`);
-      const resp = await axios.get(sourceUrl, { responseType: 'stream', timeout: 20000 });
-      await new Promise((resolve, reject) => {
-        const w = fs.createWriteStream(localPath);
-        resp.data.pipe(w);
-        w.on('finish', resolve);
-        w.on('error', reject);
-      });
+      // Attempt download with retry/backoff; do not retry on 404
+      let success = false;
+      let lastErr = null;
+      for (let i = 1; i <= 3; i++) {
+        try {
+          const resp = await axiosClient.get(sourceUrl, { responseType: 'stream' });
+          await new Promise((resolve, reject) => {
+            const w = fs.createWriteStream(localPath);
+            resp.data.pipe(w);
+            w.on('finish', resolve);
+            w.on('error', reject);
+          });
+          success = true;
+          break;
+        } catch (e) {
+          lastErr = e;
+          const status = e.response?.status;
+          if (status === 404) {
+            // Not found: do not retry this URL
+            break;
+          }
+          if (i < 3) {
+            const delay = 300 * Math.pow(2, i - 1);
+            await new Promise(r => setTimeout(r, delay));
+          }
+        }
+      }
+      if (!success) {
+        throw lastErr || new Error('Image download failed');
+      }
       console.log(`🗂️ Image cached: /cdn/${subpath}`);
     } else {
       console.log(`🗂️ Using cached image: /cdn/${subpath}`);
@@ -95,7 +157,7 @@ app.get('/api/nasa/apod', async (req, res) => {
                    (req.query.date ? `&date=${req.query.date}` : '');
     
     // Fetch from NASA
-    const response = await axios.get(apiUrl, { timeout: 10000 });
+  const response = await axiosClient.get(apiUrl, { timeout: 10000 });
     
     // Handle video content by providing thumbnail or fallback
     const nasaData = response.data;
@@ -197,30 +259,63 @@ app.get('/api/nasa/epic', async (req, res) => {
       throw new Error('NASA_API_KEY not configured');
     }
     
-    // Fetch from NASA: allow optional ?date=YYYY-MM-DD and fallback across recent days if needed
+    // Fetch from NASA: allow optional ?date=YYYY-MM-DD, optional ?collection=natural|enhanced
     const dateParam = (req.query.date || '').toString().trim();
-    const baseApi = 'https://api.nasa.gov/EPIC/api/natural';
-    const tryFetch = async (url) => axios.get(url, { timeout: 20000 }).then(r => r.data).catch(() => null);
+    const requestedCollection = (req.query.collection || 'natural').toString().trim().toLowerCase();
+    const collectionsToTry = requestedCollection === 'enhanced' ? ['enhanced', 'natural'] : ['natural', 'enhanced'];
+
     let items = null;
-    if (dateParam) {
-      items = await tryFetch(`${baseApi}/date/${dateParam}?api_key=${NASA_API_KEY}`);
-    } else {
-      items = await tryFetch(`${baseApi}?api_key=${NASA_API_KEY}`);
-    }
-    // If nothing came back, look back up to 5 days
-    if (!items || (Array.isArray(items) && items.length === 0)) {
-      const lookback = 5;
-      const now = new Date();
-      for (let i = 1; i <= lookback; i++) {
-        const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
-        d.setUTCDate(d.getUTCDate() - i);
-        const yyyy = d.getUTCFullYear();
-        const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-        const dd = String(d.getUTCDate()).padStart(2, '0');
-        const ds = `${yyyy}-${mm}-${dd}`;
-        const alt = await tryFetch(`${baseApi}/date/${ds}?api_key=${NASA_API_KEY}`);
-        if (alt && Array.isArray(alt) && alt.length > 0) { items = alt; break; }
+    let usedCollection = collectionsToTry[0];
+    const fetchItemsFor = async (collection, dateStr) => {
+      const baseApi = `https://api.nasa.gov/EPIC/api/${collection}`;
+      try {
+        if (dateStr) {
+          return await fetchJsonWithRetry(`${baseApi}/date/${dateStr}?api_key=${NASA_API_KEY}`);
+        }
+        return await fetchJsonWithRetry(`${baseApi}?api_key=${NASA_API_KEY}`);
+      } catch (_e) {
+        return null;
       }
+    };
+    const fetchAvailableDates = async (collection) => {
+      try {
+        const data = await fetchJsonWithRetry(`https://api.nasa.gov/EPIC/api/${collection}/available?api_key=${NASA_API_KEY}`);
+        // Return most recent first
+        return Array.isArray(data) ? data.sort().reverse() : [];
+      } catch (_e) {
+        return [];
+      }
+    };
+
+    for (const collection of collectionsToTry) {
+      usedCollection = collection;
+      // 1) Try requested date or today API
+      items = await fetchItemsFor(collection, dateParam || null);
+      // 2) If nothing, walk back up to 10 days
+      if (!items || (Array.isArray(items) && items.length === 0)) {
+        const lookback = 10;
+        const now = new Date();
+        for (let i = 1; i <= lookback; i++) {
+          const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+          d.setUTCDate(d.getUTCDate() - i);
+          const yyyy = d.getUTCFullYear();
+          const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+          const dd = String(d.getUTCDate()).padStart(2, '0');
+          const ds = `${yyyy}-${mm}-${dd}`;
+          const alt = await fetchItemsFor(collection, ds);
+          if (alt && Array.isArray(alt) && alt.length > 0) { items = alt; break; }
+        }
+      }
+      // 3) If still nothing, use the 'available' list and pick the latest date
+      if (!items || (Array.isArray(items) && items.length === 0)) {
+        const dates = await fetchAvailableDates(collection);
+        if (dates.length > 0) {
+          // prefer most recent available date
+          const latest = dates[0];
+          items = await fetchItemsFor(collection, latest);
+        }
+      }
+      if (items && Array.isArray(items) && items.length > 0) break; // got data
     }
     if (!items) throw new Error('EPIC API returned no data');
     // Attach backend-hosted image_url for each record and cache the image
@@ -235,12 +330,12 @@ app.get('/api/nasa/epic', async (req, res) => {
         const dd = String(dateObj.getUTCDate()).padStart(2, '0');
         const datePath = `${yyyy}/${mm}/${dd}`;
 
-        // Try PNG then JPG on epic.gsfc first, then api.nasa.gov as a fallback (with key)
+        // Try PNG then JPG on epic.gsfc first, then api.nasa.gov as a fallback (with key), then thumbs
         const extCandidates = ['png', 'jpg'];
         let chosen = null;
         for (const ext of extCandidates) {
           const filename = `${item.image}.${ext}`;
-          const gsfcUrl = `https://epic.gsfc.nasa.gov/archive/natural/${datePath}/${ext}/${filename}`;
+          const gsfcUrl = `https://epic.gsfc.nasa.gov/archive/${usedCollection}/${datePath}/${ext}/${filename}`;
           const subpath = path.join('nasa', 'epic', yyyy, mm, dd, filename);
           const cdnUrl = await cacheImageIfNeeded(gsfcUrl, subpath, req);
           if (cdnUrl) { chosen = { cdnUrl, original: gsfcUrl }; break; }
@@ -248,10 +343,31 @@ app.get('/api/nasa/epic', async (req, res) => {
         if (!chosen && NASA_API_KEY) {
           for (const ext of extCandidates) {
             const filename = `${item.image}.${ext}`;
-            const apiUrl = `https://api.nasa.gov/EPIC/archive/natural/${datePath}/${ext}/${filename}?api_key=${NASA_API_KEY}`;
+            const apiUrl = `https://api.nasa.gov/EPIC/archive/${usedCollection}/${datePath}/${ext}/${filename}?api_key=${NASA_API_KEY}`;
             const subpath = path.join('nasa', 'epic', yyyy, mm, dd, filename);
             const cdnUrl = await cacheImageIfNeeded(apiUrl, subpath, req);
-            if (cdnUrl) { chosen = { cdnUrl, original: `https://epic.gsfc.nasa.gov/archive/natural/${datePath}/${ext}/${filename}` }; break; }
+            if (cdnUrl) { chosen = { cdnUrl, original: `https://epic.gsfc.nasa.gov/archive/${usedCollection}/${datePath}/${ext}/${filename}` }; break; }
+          }
+        }
+        // Thumbs fallback (jpg only)
+        if (!chosen) {
+          const ext = 'jpg';
+          const filename = `${item.image}.${ext}`;
+          const gsfcThumb = `https://epic.gsfc.nasa.gov/archive/${usedCollection}/${datePath}/thumbs/${filename}`;
+          const subpath = path.join('nasa', 'epic', yyyy, mm, dd, 'thumbs', filename);
+          const cdnUrl = await cacheImageIfNeeded(gsfcThumb, subpath, req);
+          if (cdnUrl) {
+            chosen = { cdnUrl, original: gsfcThumb };
+          }
+        }
+        if (!chosen && NASA_API_KEY) {
+          const ext = 'jpg';
+          const filename = `${item.image}.${ext}`;
+          const apiThumb = `https://api.nasa.gov/EPIC/archive/${usedCollection}/${datePath}/thumbs/${filename}?api_key=${NASA_API_KEY}`;
+          const subpath = path.join('nasa', 'epic', yyyy, mm, dd, 'thumbs', filename);
+          const cdnUrl = await cacheImageIfNeeded(apiThumb, subpath, req);
+          if (cdnUrl) {
+            chosen = { cdnUrl, original: `https://epic.gsfc.nasa.gov/archive/${usedCollection}/${datePath}/thumbs/${filename}` };
           }
         }
 
@@ -333,7 +449,7 @@ app.get('/api/nasa/epic', async (req, res) => {
       }
     }];
     
-    // Provide image_url for fallback as well (try PNG, then JPG, then api.nasa.gov)
+    // Provide image_url for fallback as well (try PNG, then JPG, then thumbs, then api.nasa.gov)
     try {
       const item = fallback[0];
       const dateObj = new Date(item.date.replace(' ', 'T') + 'Z');
@@ -350,6 +466,13 @@ app.get('/api/nasa/epic', async (req, res) => {
         const cdnUrl = await cacheImageIfNeeded(gsfcUrl, subpath, req);
         if (cdnUrl) { chosen = { cdnUrl, original: gsfcUrl }; break; }
       }
+      if (!chosen) {
+        const filename = `${item.image}.jpg`;
+        const gsfcThumb = `https://epic.gsfc.nasa.gov/archive/natural/${datePath}/thumbs/${filename}`;
+        const subpath = path.join('nasa', 'epic', yyyy, mm, dd, 'thumbs', filename);
+        const cdnUrl = await cacheImageIfNeeded(gsfcThumb, subpath, req);
+        if (cdnUrl) { chosen = { cdnUrl, original: gsfcThumb }; }
+      }
       if (!chosen && NASA_API_KEY) {
         for (const ext of extCandidates) {
           const filename = `${item.image}.${ext}`;
@@ -358,6 +481,13 @@ app.get('/api/nasa/epic', async (req, res) => {
           const cdnUrl = await cacheImageIfNeeded(apiUrl, subpath, req);
           if (cdnUrl) { chosen = { cdnUrl, original: `https://epic.gsfc.nasa.gov/archive/natural/${datePath}/${ext}/${filename}` }; break; }
         }
+      }
+      if (!chosen && NASA_API_KEY) {
+        const filename = `${item.image}.jpg`;
+        const apiThumb = `https://api.nasa.gov/EPIC/archive/natural/${datePath}/thumbs/${filename}?api_key=${NASA_API_KEY}`;
+        const subpath = path.join('nasa', 'epic', yyyy, mm, dd, 'thumbs', filename);
+        const cdnUrl = await cacheImageIfNeeded(apiThumb, subpath, req);
+        if (cdnUrl) { chosen = { cdnUrl, original: `https://epic.gsfc.nasa.gov/archive/natural/${datePath}/thumbs/${filename}` }; }
       }
       if (chosen) {
         fallback[0] = { ...item, image_url: chosen.cdnUrl, original_url: chosen.original };
