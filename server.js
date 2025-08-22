@@ -80,6 +80,25 @@ const axiosClient = axios.create({
   }
 });
 
+// Separate client for image downloads: prefer IPv4, disable keep-alive, follow redirects, set Accept for images
+const axiosImageClient = axios.create({
+  timeout: 20000,
+  maxRedirects: 5,
+  httpAgent: new http.Agent({ keepAlive: false, lookup: ipv4Lookup }),
+  httpsAgent: new https.Agent({ keepAlive: false, lookup: ipv4Lookup }),
+  headers: {
+    'User-Agent': 'The-Inner-Citadel/1.0 (+https://example.com)',
+    'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+    'Accept-Encoding': 'identity',
+    'Connection': 'close'
+  }
+});
+
+const NASA_TRACE = /^(1|true|yes)$/i.test(process.env.NASA_TRACE || '');
+function trace(...args) {
+  if (NASA_TRACE) console.log('[TRACE]', ...args);
+}
+
 // Generic fetch with simple retry/backoff; do not retry on 4xx
 async function fetchJsonWithRetry(url, { attempts = 2, initialDelayMs = 250, timeoutMs = 15000 } = {}) {
   let lastErr = null;
@@ -128,7 +147,27 @@ async function cacheImageIfNeeded(sourceUrl, subpath, req) {
       let lastErr = null;
       for (let i = 1; i <= 3; i++) {
         try {
-          const resp = await axiosClient.get(sourceUrl, { responseType: 'stream' });
+          // Quick HEAD preflight to avoid long hangs on bad URLs; short timeout
+          try {
+            const u = new URL(sourceUrl);
+            try {
+              const ip = await dns.promises.lookup(u.hostname, { family: 4 });
+              trace('DNS A', u.hostname, '->', ip.address);
+            } catch (e) {
+              trace('DNS lookup failed', u.hostname, e.message);
+            }
+            const head = await axiosImageClient.head(sourceUrl, { timeout: 5000, validateStatus: () => true });
+            trace('HEAD', head.status, sourceUrl);
+            if (head.status === 404) {
+              // Not found: no more retries for this URL
+              lastErr = new Error('404 Not Found (HEAD)');
+              break;
+            }
+          } catch (e) {
+            trace('HEAD error', e.message);
+            // Continue to GET attempt; HEAD may be blocked by some CDNs
+          }
+          const resp = await axiosImageClient.get(sourceUrl, { responseType: 'stream' });
           await new Promise((resolve, reject) => {
             const w = fs.createWriteStream(localPath);
             resp.data.pipe(w);
@@ -475,6 +514,43 @@ app.get('/api/nasa/epic', async (req, res) => {
     }];
     console.log('🌍 Serving static fallback EPIC');
     respondJson(res, fallback);
+  }
+});
+
+// Lightweight EPIC status endpoint (diagnostics, no heavy external calls by default)
+app.get('/api/nasa/epic/status', async (req, res) => {
+  try {
+    const last = await loadLastEpic();
+    const base = getPublicBase(req) || '';
+    const result = {
+      nasa_api_key: !!NASA_API_KEY,
+      last_epic: last ? {
+        date: last.date || null,
+        collection: last.collection || null,
+        subpath: last.subpath || null,
+        original_url: last.original_url || null,
+        cdn_url: last.subpath ? `${base}/cdn/${last.subpath}` : null
+      } : null,
+      now: new Date().toISOString()
+    };
+
+    // Optional quick upstream probe (3s timeout) if `?probe=1`
+    if (req.query.probe === '1') {
+      const url = `https://api.nasa.gov/EPIC/api/natural/available?api_key=${NASA_API_KEY || 'DEMO_KEY'}`;
+      try {
+        const data = await fetchJsonWithRetry(url, { attempts: 1, timeoutMs: 3000 });
+        result.upstream_probe = { ok: true, sample_count: Array.isArray(data) ? data.length : null };
+      } catch (e) {
+        result.upstream_probe = {
+          ok: false,
+          error: e.response?.status ? `HTTP ${e.response.status}` : (e.code || e.message || 'error')
+        };
+      }
+    }
+
+    respondJson(res, result);
+  } catch (e) {
+    respondJson(res, { error: e.message }, 500);
   }
 });
 
