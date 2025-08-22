@@ -16,8 +16,8 @@ app.use(express.json());
 const NASA_API_KEY = process.env.NASA_API_KEY;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL; // e.g. https://stoic-app-thbdd.ondigitalocean.app
 
-// Serve cached static assets (images) from ./public via /cdn
-const PUBLIC_DIR = path.join(__dirname, 'public');
+// Serve cached static assets (images) from a writable dir via /cdn (default: /tmp/public)
+const PUBLIC_DIR = process.env.PUBLIC_DIR || path.join('/tmp', 'public');
 app.use('/cdn', express.static(PUBLIC_DIR, {
   maxAge: '12h',
   immutable: false,
@@ -314,4 +314,5 @@ app.listen(PORT, () => {
   console.log(`🚀 NASA API Proxy server running on port ${PORT}`);
   console.log(`📊 Health check: http://localhost:${PORT}/health`);
   console.log(`🔧 Debug info: http://localhost:${PORT}/debug`);
+  console.log(`🗂️ CDN cache directory: ${PUBLIC_DIR}`);
 });
