@@ -208,17 +208,39 @@ app.get('/api/nasa/epic', async (req, res) => {
     const enhanced = [];
     for (const item of items) {
       try {
-        // EPIC date like "2024-08-10 00:00:00" => yyyy/MM/dd
-        const dateObj = new Date(item.date.replace(' ', 'T') + 'Z');
+        // EPIC date like "YYYY-MM-DD HH:mm:ss" => yyyy/MM/dd
+        const dateObj = new Date((item.date || '').replace(' ', 'T') + 'Z');
         const yyyy = String(dateObj.getUTCFullYear());
         const mm = String(dateObj.getUTCMonth() + 1).padStart(2, '0');
         const dd = String(dateObj.getUTCDate()).padStart(2, '0');
         const datePath = `${yyyy}/${mm}/${dd}`;
-        const filename = `${item.image}.png`;
-        const nasaUrl = `https://epic.gsfc.nasa.gov/archive/natural/${datePath}/png/${filename}`;
-        const subpath = path.join('nasa', 'epic', yyyy, mm, dd, filename);
-  const cdnUrl = await cacheImageIfNeeded(nasaUrl, subpath, req);
-        enhanced.push({ ...item, image_url: cdnUrl || nasaUrl, original_url: nasaUrl });
+
+        // Try PNG then JPG on epic.gsfc first, then api.nasa.gov as a fallback (with key)
+        const extCandidates = ['png', 'jpg'];
+        let chosen = null;
+        for (const ext of extCandidates) {
+          const filename = `${item.image}.${ext}`;
+          const gsfcUrl = `https://epic.gsfc.nasa.gov/archive/natural/${datePath}/${ext}/${filename}`;
+          const subpath = path.join('nasa', 'epic', yyyy, mm, dd, filename);
+          const cdnUrl = await cacheImageIfNeeded(gsfcUrl, subpath, req);
+          if (cdnUrl) { chosen = { cdnUrl, original: gsfcUrl }; break; }
+        }
+        if (!chosen && NASA_API_KEY) {
+          for (const ext of extCandidates) {
+            const filename = `${item.image}.${ext}`;
+            const apiUrl = `https://api.nasa.gov/EPIC/archive/natural/${datePath}/${ext}/${filename}?api_key=${NASA_API_KEY}`;
+            const subpath = path.join('nasa', 'epic', yyyy, mm, dd, filename);
+            const cdnUrl = await cacheImageIfNeeded(apiUrl, subpath, req);
+            if (cdnUrl) { chosen = { cdnUrl, original: `https://epic.gsfc.nasa.gov/archive/natural/${datePath}/${ext}/${filename}` }; break; }
+          }
+        }
+
+        if (chosen) {
+          enhanced.push({ ...item, image_url: chosen.cdnUrl, original_url: chosen.original });
+        } else {
+          // Could not cache; return item without image_url to avoid 404s
+          enhanced.push({ ...item, original_url: undefined });
+        }
       } catch (e) {
         console.error('EPIC enhance error:', e.message);
         enhanced.push(item);
@@ -291,19 +313,35 @@ app.get('/api/nasa/epic', async (req, res) => {
       }
     }];
     
-    // Provide image_url for fallback as well
+    // Provide image_url for fallback as well (try PNG, then JPG, then api.nasa.gov)
     try {
       const item = fallback[0];
       const dateObj = new Date(item.date.replace(' ', 'T') + 'Z');
       const yyyy = String(dateObj.getUTCFullYear());
       const mm = String(dateObj.getUTCMonth() + 1).padStart(2, '0');
-      const dd = String(dateObj.getUTCDate()).padStart(2, '0');
+      const dd = String(dateObj.getUTCDate());
       const datePath = `${yyyy}/${mm}/${dd}`;
-      const filename = `${item.image}.png`;
-      const nasaUrl = `https://epic.gsfc.nasa.gov/archive/natural/${datePath}/png/${filename}`;
-      const subpath = path.join('nasa', 'epic', yyyy, mm, dd, filename);
-  const cdnUrl = await cacheImageIfNeeded(nasaUrl, subpath, req);
-      fallback[0] = { ...item, image_url: cdnUrl || nasaUrl, original_url: nasaUrl };
+      const extCandidates = ['png', 'jpg'];
+      let chosen = null;
+      for (const ext of extCandidates) {
+        const filename = `${item.image}.${ext}`;
+        const gsfcUrl = `https://epic.gsfc.nasa.gov/archive/natural/${datePath}/${ext}/${filename}`;
+        const subpath = path.join('nasa', 'epic', yyyy, mm, dd, filename);
+        const cdnUrl = await cacheImageIfNeeded(gsfcUrl, subpath, req);
+        if (cdnUrl) { chosen = { cdnUrl, original: gsfcUrl }; break; }
+      }
+      if (!chosen && NASA_API_KEY) {
+        for (const ext of extCandidates) {
+          const filename = `${item.image}.${ext}`;
+          const apiUrl = `https://api.nasa.gov/EPIC/archive/natural/${datePath}/${ext}/${filename}?api_key=${NASA_API_KEY}`;
+          const subpath = path.join('nasa', 'epic', yyyy, mm, dd, filename);
+          const cdnUrl = await cacheImageIfNeeded(apiUrl, subpath, req);
+          if (cdnUrl) { chosen = { cdnUrl, original: `https://epic.gsfc.nasa.gov/archive/natural/${datePath}/${ext}/${filename}` }; break; }
+        }
+      }
+      if (chosen) {
+        fallback[0] = { ...item, image_url: chosen.cdnUrl, original_url: chosen.original };
+      }
     } catch {}
     console.log('🌍 Serving fallback EPIC data');
     res.json(fallback);
