@@ -12,6 +12,7 @@ const PORT = process.env.PORT || 3000;
 // Middleware
 app.use(cors());
 app.use(express.json());
+app.set('trust proxy', true); // allow x-forwarded-* headers for proto/host behind proxies
 
 const NASA_API_KEY = process.env.NASA_API_KEY;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL; // e.g. https://stoic-app-thbdd.ondigitalocean.app
@@ -27,8 +28,16 @@ async function ensureDir(dirPath) {
   await fsp.mkdir(dirPath, { recursive: true }).catch(() => {});
 }
 
+function getPublicBase(req) {
+  if (PUBLIC_BASE_URL && PUBLIC_BASE_URL.startsWith('http')) return PUBLIC_BASE_URL;
+  const proto = (req.get('x-forwarded-proto') || req.protocol || 'http').split(',')[0].trim();
+  const host = req.get('x-forwarded-host') || req.get('host');
+  if (!host) return '';
+  return `${proto}://${host}`;
+}
+
 // Download an image to the local cache if missing; return absolute public URL
-async function cacheImageIfNeeded(sourceUrl, subpath) {
+async function cacheImageIfNeeded(sourceUrl, subpath, req) {
   try {
     const localPath = path.join(PUBLIC_DIR, subpath);
     const localDir = path.dirname(localPath);
@@ -46,8 +55,8 @@ async function cacheImageIfNeeded(sourceUrl, subpath) {
     } else {
       console.log(`🗂️ Using cached image: /cdn/${subpath}`);
     }
-    const base = PUBLIC_BASE_URL || '';
-    return `${base}/cdn/${subpath}`;
+  const base = getPublicBase(req) || '';
+  return `${base}/cdn/${subpath}`;
   } catch (e) {
     console.error('❌ cacheImageIfNeeded error:', e.message);
     return null;
@@ -147,7 +156,7 @@ app.get('/api/nasa/apod', async (req, res) => {
         const dateStr = (nasaData.date || new Date().toISOString().split('T')[0]).replace(/\//g, '-');
         const filename = `apod_${dateStr}${ext}`;
         const subpath = path.join('nasa', 'apod', filename);
-        const cdnUrl = await cacheImageIfNeeded(originalDisplay, subpath);
+  const cdnUrl = await cacheImageIfNeeded(originalDisplay, subpath, req);
         if (cdnUrl) {
           nasaData.display_url = cdnUrl; // prefer this in clients
           nasaData.original_url = originalDisplay; // keep original for reference
@@ -208,7 +217,7 @@ app.get('/api/nasa/epic', async (req, res) => {
         const filename = `${item.image}.png`;
         const nasaUrl = `https://epic.gsfc.nasa.gov/archive/natural/${datePath}/png/${filename}`;
         const subpath = path.join('nasa', 'epic', yyyy, mm, dd, filename);
-        const cdnUrl = await cacheImageIfNeeded(nasaUrl, subpath);
+  const cdnUrl = await cacheImageIfNeeded(nasaUrl, subpath, req);
         enhanced.push({ ...item, image_url: cdnUrl || nasaUrl, original_url: nasaUrl });
       } catch (e) {
         console.error('EPIC enhance error:', e.message);
@@ -293,7 +302,7 @@ app.get('/api/nasa/epic', async (req, res) => {
       const filename = `${item.image}.png`;
       const nasaUrl = `https://epic.gsfc.nasa.gov/archive/natural/${datePath}/png/${filename}`;
       const subpath = path.join('nasa', 'epic', yyyy, mm, dd, filename);
-      const cdnUrl = await cacheImageIfNeeded(nasaUrl, subpath);
+  const cdnUrl = await cacheImageIfNeeded(nasaUrl, subpath, req);
       fallback[0] = { ...item, image_url: cdnUrl || nasaUrl, original_url: nasaUrl };
     } catch {}
     console.log('🌍 Serving fallback EPIC data');
