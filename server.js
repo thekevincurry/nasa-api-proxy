@@ -9,6 +9,16 @@ const fs = require('fs');
 const fsp = require('fs').promises;
 const path = require('path');
 
+// NASA API Proxy Server
+// =====================
+// This server proxies NASA APIs that require authentication.
+// 
+// Current endpoints:
+// - /api/nasa/apod - NASA Astronomy Picture of the Day (requires API key)
+// 
+// Note: EPIC (Earth Polychromatic Imaging Camera) endpoint removed.
+// The iOS app now uses direct NASA EPIC API calls (no authentication required).
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -49,23 +59,8 @@ app.use('/cdn', express.static(PUBLIC_DIR, {
   immutable: false,
 }));
 
-// Meta storage for last-known-good items
+// Meta storage for last-known-good items (EPIC support removed - app now uses direct NASA API)
 const META_DIR = path.join(PUBLIC_DIR, '_meta');
-const LAST_EPIC_PATH = path.join(META_DIR, 'last_epic.json');
-
-async function saveLastEpic(entry) {
-  try {
-    await ensureDir(META_DIR);
-    await fsp.writeFile(LAST_EPIC_PATH, JSON.stringify(entry, null, 2), 'utf-8');
-  } catch (_) { /* ignore */ }
-}
-
-async function loadLastEpic() {
-  try {
-    const raw = await fsp.readFile(LAST_EPIC_PATH, 'utf-8');
-    return JSON.parse(raw);
-  } catch (_) { return null; }
-}
 
 // Create an axios client that prefers IPv4 (helps avoid IPv6/proxy issues) and reuses connections
 const ipv4Lookup = (hostname, options, callback) => {
@@ -329,231 +324,6 @@ app.get('/api/nasa/apod', async (req, res) => {
   }
 });
 
-// NASA EPIC endpoint
-app.get('/api/nasa/epic', async (req, res) => {
-  try {
-    console.log('Fetching EPIC from NASA API');
-    
-    if (!NASA_API_KEY) {
-      throw new Error('NASA_API_KEY not configured');
-    }
-    
-    // Fetch from NASA: allow optional ?date=YYYY-MM-DD, optional ?collection=natural|enhanced
-    const dateParam = (req.query.date || '').toString().trim();
-    const requestedCollection = (req.query.collection || 'natural').toString().trim().toLowerCase();
-    const collectionsToTry = requestedCollection === 'enhanced' ? ['enhanced', 'natural'] : ['natural', 'enhanced'];
-
-    let items = null;
-    let usedCollection = collectionsToTry[0];
-    const fetchItemsFor = async (collection, dateStr) => {
-      const baseApi = `https://api.nasa.gov/EPIC/api/${collection}`;
-      try {
-        if (dateStr) {
-          return await fetchJsonWithRetry(`${baseApi}/date/${dateStr}?api_key=${NASA_API_KEY}`);
-        }
-        return await fetchJsonWithRetry(`${baseApi}?api_key=${NASA_API_KEY}`);
-      } catch (_e) {
-        return null;
-      }
-    };
-    const fetchAvailableDates = async (collection) => {
-      try {
-        const data = await fetchJsonWithRetry(`https://api.nasa.gov/EPIC/api/${collection}/available?api_key=${NASA_API_KEY}`);
-        // Return most recent first
-        return Array.isArray(data) ? data.sort().reverse() : [];
-      } catch (_e) {
-        return [];
-      }
-    };
-
-    // Strategy: available-first, then limited lookback to reduce latency; limit items processed to 1–2
-    for (const collection of collectionsToTry) {
-      usedCollection = collection;
-      const available = await fetchAvailableDates(collection);
-      const candidateDates = [];
-      if (dateParam) candidateDates.push(dateParam);
-      // add latest available dates (up to 3) if not already included
-      for (const d of available.slice(0, 3)) {
-        if (!candidateDates.includes(d)) candidateDates.push(d);
-      }
-      // add yesterday as a simple fallback
-      if (candidateDates.length === 0) {
-        const now = new Date();
-        const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1));
-        const yyyy = d.getUTCFullYear();
-        const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-        const dd = String(d.getUTCDate()).padStart(2, '0');
-        candidateDates.push(`${yyyy}-${mm}-${dd}`);
-      }
-
-      for (const ds of candidateDates) {
-        const alt = await fetchItemsFor(collection, ds);
-        if (alt && Array.isArray(alt) && alt.length > 0) { items = alt; break; }
-      }
-
-      if (!items || (Array.isArray(items) && items.length === 0)) {
-        // As a final attempt, call without a date (today endpoint)
-        items = await fetchItemsFor(collection, null);
-      }
-      if (items && Array.isArray(items) && items.length > 0) break; // got data
-    }
-    if (!items) throw new Error('EPIC API returned no data');
-    // Attach backend-hosted image_url for each record and cache the image
-    items = Array.isArray(items) ? items : [items];
-    // Only process first 2 items to avoid long hangs; clients only need one most recent image
-    const slice = items.slice(0, 2);
-    const enhanced = [];
-    let firstImageFound = null;
-    for (const item of slice) {
-      try {
-        // EPIC date like "YYYY-MM-DD HH:mm:ss" => yyyy/MM/dd
-        const dateObj = new Date((item.date || '').replace(' ', 'T') + 'Z');
-        const yyyy = String(dateObj.getUTCFullYear());
-        const mm = String(dateObj.getUTCMonth() + 1).padStart(2, '0');
-        const dd = String(dateObj.getUTCDate()).padStart(2, '0');
-        const datePath = `${yyyy}/${mm}/${dd}`;
-
-        // Try PNG then JPG on epic.gsfc first, then api.nasa.gov as a fallback (with key), then thumbs
-        const extCandidates = ['png', 'jpg'];
-        let chosen = null;
-        for (const ext of extCandidates) {
-          const filename = `${item.image}.${ext}`;
-          const gsfcUrl = `https://epic.gsfc.nasa.gov/archive/${usedCollection}/${datePath}/${ext}/${filename}`;
-          const subpath = path.join('nasa', 'epic', yyyy, mm, dd, filename);
-          const cdnUrl = await cacheImageIfNeeded(gsfcUrl, subpath, req);
-          if (cdnUrl) { chosen = { cdnUrl, original: gsfcUrl, subpath }; break; }
-        }
-        if (!chosen && NASA_API_KEY) {
-          for (const ext of extCandidates) {
-            const filename = `${item.image}.${ext}`;
-            const apiUrl = `https://api.nasa.gov/EPIC/archive/${usedCollection}/${datePath}/${ext}/${filename}?api_key=${NASA_API_KEY}`;
-            const subpath = path.join('nasa', 'epic', yyyy, mm, dd, filename);
-            const cdnUrl = await cacheImageIfNeeded(apiUrl, subpath, req);
-            if (cdnUrl) { chosen = { cdnUrl, original: `https://epic.gsfc.nasa.gov/archive/${usedCollection}/${datePath}/${ext}/${filename}`, subpath }; break; }
-          }
-        }
-        // Thumbs fallback (jpg only)
-        if (!chosen) {
-          const ext = 'jpg';
-          const filename = `${item.image}.${ext}`;
-          const gsfcThumb = `https://epic.gsfc.nasa.gov/archive/${usedCollection}/${datePath}/thumbs/${filename}`;
-          const subpath = path.join('nasa', 'epic', yyyy, mm, dd, 'thumbs', filename);
-          const cdnUrl = await cacheImageIfNeeded(gsfcThumb, subpath, req);
-          if (cdnUrl) {
-            chosen = { cdnUrl, original: gsfcThumb, subpath };
-          }
-        }
-        if (!chosen && NASA_API_KEY) {
-          const ext = 'jpg';
-          const filename = `${item.image}.${ext}`;
-          const apiThumb = `https://api.nasa.gov/EPIC/archive/${usedCollection}/${datePath}/thumbs/${filename}?api_key=${NASA_API_KEY}`;
-          const subpath = path.join('nasa', 'epic', yyyy, mm, dd, 'thumbs', filename);
-          const cdnUrl = await cacheImageIfNeeded(apiThumb, subpath, req);
-          if (cdnUrl) {
-            chosen = { cdnUrl, original: `https://epic.gsfc.nasa.gov/archive/${usedCollection}/${datePath}/thumbs/${filename}`, subpath };
-          }
-        }
-
-        if (chosen) {
-          const enriched = { ...item, image_url: chosen.cdnUrl, original_url: chosen.original, collection: usedCollection };
-          enhanced.push(enriched);
-          // Save last-known-good entry for offline fallback
-          saveLastEpic({
-            date: item.date,
-            collection: usedCollection,
-            subpath: chosen.subpath,
-            original_url: chosen.original
-          }).catch(() => {});
-          if (!firstImageFound) firstImageFound = enriched;
-          // If we found a valid image, we can stop early
-          break;
-        } else {
-          // Could not cache; return item without image_url to avoid 404s
-          enhanced.push({ ...item, original_url: undefined });
-        }
-      } catch (e) {
-        console.error('EPIC enhance error:', e.message);
-        enhanced.push(item);
-      }
-    }
-
-  console.log('✅ EPIC fetched successfully');
-  if (!respondJson(res, enhanced)) return;
-  } catch (error) {
-    console.error('EPIC API error:', error.message);
-    
-    // Try last-known-good EPIC from local cache to avoid external fetches
-    try {
-      const last = await loadLastEpic();
-      if (last && last.subpath) {
-        const base = getPublicBase(req) || '';
-        const cdnUrl = `${base}/cdn/${last.subpath}`;
-        console.log('🌍 Serving last-known-good EPIC');
-        return res.json([
-          {
-            identifier: 'last_known_good',
-            image: path.basename(last.subpath, path.extname(last.subpath)),
-            date: last.date || new Date().toISOString().split('T')[0] + ' 00:00:00',
-            image_url: cdnUrl,
-            original_url: last.original_url,
-            collection: last.collection || 'natural'
-          }
-        ]);
-      }
-    } catch (_) { /* ignore and continue to static fallback */ }
-
-    // Return static fallback data fast (no remote fetches)
-    const fallback = [{
-      identifier: 'fallback_epic',
-      caption: 'EPIC data temporarily unavailable; showing a placeholder Earth image',
-      image: 'placeholder',
-      date: new Date().toISOString().split('T')[0] + ' 00:00:00',
-      image_url: 'https://images.unsplash.com/photo-1451187580459-43490279c0fa?w=1200&auto=format&fit=crop&q=80',
-      original_url: null,
-      collection: 'natural'
-    }];
-    console.log('🌍 Serving static fallback EPIC');
-    respondJson(res, fallback);
-  }
-});
-
-// Lightweight EPIC status endpoint (diagnostics, no heavy external calls by default)
-app.get('/api/nasa/epic/status', async (req, res) => {
-  try {
-    const last = await loadLastEpic();
-    const base = getPublicBase(req) || '';
-    const result = {
-      nasa_api_key: !!NASA_API_KEY,
-      last_epic: last ? {
-        date: last.date || null,
-        collection: last.collection || null,
-        subpath: last.subpath || null,
-        original_url: last.original_url || null,
-        cdn_url: last.subpath ? `${base}/cdn/${last.subpath}` : null
-      } : null,
-      now: new Date().toISOString()
-    };
-
-    // Optional quick upstream probe (3s timeout) if `?probe=1`
-    if (req.query.probe === '1') {
-      const url = `https://api.nasa.gov/EPIC/api/natural/available?api_key=${NASA_API_KEY || 'DEMO_KEY'}`;
-      try {
-        const data = await fetchJsonWithRetry(url, { attempts: 1, timeoutMs: 3000 });
-        result.upstream_probe = { ok: true, sample_count: Array.isArray(data) ? data.length : null };
-      } catch (e) {
-        result.upstream_probe = {
-          ok: false,
-          error: e.response?.status ? `HTTP ${e.response.status}` : (e.code || e.message || 'error')
-        };
-      }
-    }
-
-    respondJson(res, result);
-  } catch (e) {
-    respondJson(res, { error: e.message }, 500);
-  }
-});
-
 // Debug endpoint to check environment
 app.get('/debug', (req, res) => {
   res.json({
@@ -564,8 +334,9 @@ app.get('/debug', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 NASA API Proxy server running on port ${PORT}`);
+  console.log(`🚀 NASA APOD Proxy server running on port ${PORT}`);
   console.log(`📊 Health check: http://localhost:${PORT}/health`);
   console.log(`🔧 Debug info: http://localhost:${PORT}/debug`);
   console.log(`🗂️ CDN cache directory: ${PUBLIC_DIR}`);
+  console.log(`ℹ️  EPIC API removed - iOS app now uses direct NASA API`);
 });
